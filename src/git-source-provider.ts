@@ -105,12 +105,36 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
     // Save state for POST action
     stateHelper.setRepositoryPath(settings.repositoryPath)
 
+    let defaultBranch = ''
+
     // Initialize the repository
     if (
       !fsHelper.directoryExistsSync(path.join(settings.repositoryPath, '.git'))
     ) {
+      core.startGroup('Determining repository object format')
+      let objectFormatResult =
+        await githubApiHelper.tryGetRepositoryObjectFormat(
+          settings.authToken,
+          settings.repositoryOwner,
+          settings.repositoryName,
+          settings.githubServerUrl,
+          settings.ref,
+          settings.commit
+        )
+      if (!objectFormatResult.succeeded) {
+        objectFormatResult = await git.tryGetObjectFormat(repositoryUrl)
+      }
+      const objectFormat = objectFormatResult.succeeded
+        ? objectFormatResult.format
+        : ''
+      defaultBranch = objectFormatResult.defaultBranch || ''
+      if (objectFormat === 'sha256') {
+        core.info('Detected SHA-256 repository object format')
+      }
+      core.endGroup()
+
       core.startGroup('Initializing the repository')
-      await git.init()
+      await git.init(objectFormat)
       await git.remoteAdd('origin', repositoryUrl)
       core.endGroup()
     }
@@ -138,6 +162,9 @@ export async function getSource(settings: IGitSourceSettings): Promise<void> {
       core.startGroup('Determining the default branch')
       if (settings.sshKey) {
         settings.ref = await git.getDefaultBranch(repositoryUrl)
+      } else if (defaultBranch) {
+        core.info(`Default branch '${defaultBranch}'`)
+        settings.ref = `refs/heads/${defaultBranch}`
       } else {
         settings.ref = await githubApiHelper.getDefaultBranch(
           settings.authToken,

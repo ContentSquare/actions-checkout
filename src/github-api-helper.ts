@@ -11,6 +11,12 @@ import {getServerApiUrl} from './url-helper'
 
 const IS_WINDOWS = process.platform === 'win32'
 
+export interface RepositoryObjectFormatResult {
+  defaultBranch?: string
+  format: string
+  succeeded: boolean
+}
+
 export async function downloadRepository(
   authToken: string,
   owner: string,
@@ -120,6 +126,84 @@ export async function getDefaultBranch(
 
     return result
   })
+}
+
+export async function tryGetRepositoryObjectFormat(
+  authToken: string,
+  owner: string,
+  repo: string,
+  baseUrl?: string,
+  ref?: string,
+  commit?: string
+): Promise<RepositoryObjectFormatResult> {
+  try {
+    const commitFormat = getObjectFormat(commit)
+    if (commitFormat) {
+      return {format: commitFormat, succeeded: true}
+    }
+
+    const octokit = github.getOctokit(authToken, {
+      baseUrl: getServerApiUrl(baseUrl)
+    })
+
+    let branchName = getBranchName(ref)
+    let defaultBranch = ''
+    if (!branchName) {
+      const repository = await octokit.rest.repos.get({owner, repo})
+      defaultBranch = repository.data.default_branch
+      assert.ok(defaultBranch, 'default_branch cannot be empty')
+      branchName = defaultBranch
+    }
+
+    const branch = await octokit.rest.repos.getBranch({
+      owner,
+      repo,
+      branch: branchName
+    })
+    const branchFormat = getObjectFormat(branch.data.commit.sha)
+    if (branchFormat) {
+      return {
+        defaultBranch: defaultBranch || undefined,
+        format: branchFormat,
+        succeeded: true
+      }
+    }
+
+    core.debug('Unable to determine repository object format from commit SHA')
+    return {format: '', succeeded: false}
+  } catch (err) {
+    core.debug(
+      `Unable to determine repository object format: ${(err as any)?.message ?? err}`
+    )
+    return {format: '', succeeded: false}
+  }
+}
+
+function getBranchName(ref?: string): string {
+  if (!ref) {
+    return ''
+  }
+
+  const headsPrefix = 'refs/heads/'
+  if (ref.startsWith(headsPrefix)) {
+    return ref.substring(headsPrefix.length)
+  }
+
+  if (!ref.startsWith('refs/') && !getObjectFormat(ref)) {
+    return ref
+  }
+
+  return ''
+}
+
+function getObjectFormat(sha?: string): string {
+  if (/^[0-9a-fA-F]{64}$/.test(sha || '')) {
+    return 'sha256'
+  }
+  if (/^[0-9a-fA-F]{40}$/.test(sha || '')) {
+    return 'sha1'
+  }
+  return ''
 }
 
 async function downloadArchive(

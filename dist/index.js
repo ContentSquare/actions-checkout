@@ -896,9 +896,14 @@ class GitCommandManager {
     getWorkingDirectory() {
         return this.workingDirectory;
     }
-    init() {
+    init(objectFormat) {
         return __awaiter(this, void 0, void 0, function* () {
-            yield this.execGit(['init', this.workingDirectory]);
+            const args = ['init'];
+            if (objectFormat === 'sha256') {
+                args.push('--object-format=sha256');
+            }
+            args.push(this.workingDirectory);
+            yield this.execGit(args);
         });
     }
     isDetached() {
@@ -1054,6 +1059,45 @@ class GitCommandManager {
                 return '';
             }
             return stdout;
+        });
+    }
+    tryGetObjectFormat(repositoryUrl) {
+        return __awaiter(this, void 0, void 0, function* () {
+            var _a;
+            try {
+                const output = yield this.execGit([
+                    '-c',
+                    'protocol.version=2',
+                    'ls-remote',
+                    '--quiet',
+                    '--exit-code',
+                    '--symref',
+                    repositoryUrl,
+                    'HEAD'
+                ], true, true);
+                if (output.exitCode !== 0) {
+                    core.debug(`Unable to determine repository object format: git ls-remote exited with ${output.exitCode}`);
+                    return { format: '', succeeded: false };
+                }
+                for (const line of output.stdout.trim().split('\n')) {
+                    const [oid, ref] = line.split('\t');
+                    if (ref !== 'HEAD') {
+                        continue;
+                    }
+                    if (/^[0-9a-fA-F]{64}$/.test(oid)) {
+                        return { format: 'sha256', succeeded: true };
+                    }
+                    if (/^[0-9a-fA-F]{40}$/.test(oid)) {
+                        return { format: 'sha1', succeeded: true };
+                    }
+                }
+                core.debug('Unable to determine repository object format from HEAD');
+                return { format: '', succeeded: false };
+            }
+            catch (err) {
+                core.debug(`Unable to determine repository object format: ${(_a = err === null || err === void 0 ? void 0 : err.message) !== null && _a !== void 0 ? _a : err}`);
+                return { format: '', succeeded: false };
+            }
         });
     }
     tryGetConfigValues(configKey, globalConfig, configFile) {
@@ -1484,10 +1528,24 @@ function getSource(settings) {
             }
             // Save state for POST action
             stateHelper.setRepositoryPath(settings.repositoryPath);
+            let defaultBranch = '';
             // Initialize the repository
             if (!fsHelper.directoryExistsSync(path.join(settings.repositoryPath, '.git'))) {
+                core.startGroup('Determining repository object format');
+                let objectFormatResult = yield githubApiHelper.tryGetRepositoryObjectFormat(settings.authToken, settings.repositoryOwner, settings.repositoryName, settings.githubServerUrl, settings.ref, settings.commit);
+                if (!objectFormatResult.succeeded) {
+                    objectFormatResult = yield git.tryGetObjectFormat(repositoryUrl);
+                }
+                const objectFormat = objectFormatResult.succeeded
+                    ? objectFormatResult.format
+                    : '';
+                defaultBranch = objectFormatResult.defaultBranch || '';
+                if (objectFormat === 'sha256') {
+                    core.info('Detected SHA-256 repository object format');
+                }
+                core.endGroup();
                 core.startGroup('Initializing the repository');
-                yield git.init();
+                yield git.init(objectFormat);
                 yield git.remoteAdd('origin', repositoryUrl);
                 core.endGroup();
             }
@@ -1510,6 +1568,10 @@ function getSource(settings) {
                 core.startGroup('Determining the default branch');
                 if (settings.sshKey) {
                     settings.ref = yield git.getDefaultBranch(repositoryUrl);
+                }
+                else if (defaultBranch) {
+                    core.info(`Default branch '${defaultBranch}'`);
+                    settings.ref = `refs/heads/${defaultBranch}`;
                 }
                 else {
                     settings.ref = yield githubApiHelper.getDefaultBranch(settings.authToken, settings.repositoryOwner, settings.repositoryName, settings.githubServerUrl);
@@ -1810,6 +1872,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.downloadRepository = downloadRepository;
 exports.getDefaultBranch = getDefaultBranch;
+exports.tryGetRepositoryObjectFormat = tryGetRepositoryObjectFormat;
 const assert = __importStar(__nccwpck_require__(9491));
 const core = __importStar(__nccwpck_require__(2186));
 const fs = __importStar(__nccwpck_require__(7147));
@@ -1910,6 +1973,69 @@ function getDefaultBranch(authToken, owner, repo, baseUrl) {
             return result;
         }));
     });
+}
+function tryGetRepositoryObjectFormat(authToken, owner, repo, baseUrl, ref, commit) {
+    return __awaiter(this, void 0, void 0, function* () {
+        var _a;
+        try {
+            const commitFormat = getObjectFormat(commit);
+            if (commitFormat) {
+                return { format: commitFormat, succeeded: true };
+            }
+            const octokit = github.getOctokit(authToken, {
+                baseUrl: (0, url_helper_1.getServerApiUrl)(baseUrl)
+            });
+            let branchName = getBranchName(ref);
+            let defaultBranch = '';
+            if (!branchName) {
+                const repository = yield octokit.rest.repos.get({ owner, repo });
+                defaultBranch = repository.data.default_branch;
+                assert.ok(defaultBranch, 'default_branch cannot be empty');
+                branchName = defaultBranch;
+            }
+            const branch = yield octokit.rest.repos.getBranch({
+                owner,
+                repo,
+                branch: branchName
+            });
+            const branchFormat = getObjectFormat(branch.data.commit.sha);
+            if (branchFormat) {
+                return {
+                    defaultBranch: defaultBranch || undefined,
+                    format: branchFormat,
+                    succeeded: true
+                };
+            }
+            core.debug('Unable to determine repository object format from commit SHA');
+            return { format: '', succeeded: false };
+        }
+        catch (err) {
+            core.debug(`Unable to determine repository object format: ${(_a = err === null || err === void 0 ? void 0 : err.message) !== null && _a !== void 0 ? _a : err}`);
+            return { format: '', succeeded: false };
+        }
+    });
+}
+function getBranchName(ref) {
+    if (!ref) {
+        return '';
+    }
+    const headsPrefix = 'refs/heads/';
+    if (ref.startsWith(headsPrefix)) {
+        return ref.substring(headsPrefix.length);
+    }
+    if (!ref.startsWith('refs/') && !getObjectFormat(ref)) {
+        return ref;
+    }
+    return '';
+}
+function getObjectFormat(sha) {
+    if (/^[0-9a-fA-F]{64}$/.test(sha || '')) {
+        return 'sha256';
+    }
+    if (/^[0-9a-fA-F]{40}$/.test(sha || '')) {
+        return 'sha1';
+    }
+    return '';
 }
 function downloadArchive(authToken, owner, repo, ref, commit, baseUrl) {
     return __awaiter(this, void 0, void 0, function* () {
